@@ -1,0 +1,18 @@
+{
+  "source": "./src",
+  "includes": ["\\.(js|jsx)$"],
+  "destination": "./esdoc",
+  "plugins": [
+    {
+      "name": "esdoc-standard-plugin",
+      "option": {
+        "test": {
+          "source": "./test",
+          "includes": ["\\.ava\\.js$"],
+          "interfaces": ["test"]
+        }
+      }
+    },
+    {"name": "esdoc-jsx-plugin"}
+  ]
+ }
