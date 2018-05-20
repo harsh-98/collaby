@@ -1,0 +1,215 @@
+#!./node_modules/.bin/babel-node
+
+import 'babel-polyfill';
+
+/* eslint-disable no-console */
+
+import Y from 'yjs';
+import yWebsocketsServer from 'y-websockets-server';
+import yMemory from 'y-memory';
+
+import minimist from 'minimist';
+import socketIo from 'socket.io';
+import http from 'http';
+import Router from 'router';
+import finalhandler from 'finalhandler';
+import bodyParser from 'body-parser';
+import clone from 'lodash/clone';
+import crypto from 'crypto';
+
+Y.extend(yWebsocketsServer, yMemory);
+
+const options = minimist(process.argv.slice(2), {
+  string: ['port', 'debug', 'db'],
+  default: {
+    port: process.env.PORT_WEBSOCKET || '1234',
+    debug: false,
+    db: 'memory',
+  },
+});
+
+import { Client } from 'pg'
+
+
+const client = new Client({
+  user: process.env.POSTGRES_USERNAME,
+  host: process.env.POSTGRES_HOSTNAME,
+  password: process.env.POSTGRES_PASSWORD,
+  database: 'hasuradb',
+  port: process.env.POSTGRES_PORT
+})
+client.connect()
+
+client.query('SELECT NOW()', (err, res) => {
+  client.end()
+})
+
+const port = Number.parseInt(options.port, 10);
+const router = Router();
+const server = http.createServer((req, res) => {
+  router(req, res, finalhandler(req, res));
+});
+router.use(bodyParser.text());
+const io = socketIo.listen(server);
+
+const yInstances = {};
+const metadata = {};
+
+function getInstanceOfY(room) {
+  if (yInstances[room] == null) {
+    yInstances[room] = Y({
+      db: {
+        name: options.db,
+        dir: 'y-leveldb-databases',
+        namespace: room,
+      },
+      connector: {
+        name: 'websockets-server',
+        // TODO: Will be solved in future https://github.com/y-js/y-websockets-server/commit/2c8588904a334631cb6f15d8434bb97064b59583#diff-e6a5b42b2f7a26c840607370aed5301a
+        room: encodeURIComponent(room),
+        io,
+        debug: !!options.debug,
+      },
+      share: {},
+    });
+    metadata[room] = {
+      created: new Date(),
+      modified: new Date(),
+      active: 0,
+    };
+  }
+  return yInstances[room];
+}
+function removeInstanceOfY(room) {
+  delete yInstances[room];
+  delete metadata[room];
+}
+
+function getSha1Hash(plaintext) {
+  const sha1 = crypto.createHash('sha1');
+  sha1.update(plaintext);
+  return sha1.digest('hex');
+}
+
+router.get('/pages', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(Object.keys(metadata).map((k) => {
+    const m = metadata[k];
+    return {
+      page: k,
+      created: m.created,
+      modified: m.modified,
+      active: m.active,
+    };
+  })));
+});
+
+router.post('/deletePage', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  const room = req.body;
+  const yPromise = yInstances[room];
+  if (!yPromise) {
+    res.end(JSON.stringify({ status: 'FAILURE', msg: 'No y instance' }));
+    return;
+  }
+  try {
+    const y = await yPromise;
+    const roomMetadata = metadata[room];
+    if (!roomMetadata) {
+      res.end(JSON.stringify({ status: 'FAILURE', msg: 'No metadata' }));
+      return;
+    }
+    if (roomMetadata.active > 0) {
+      res.end(JSON.stringify({ status: 'FAILURE', msg: 'There are still users on this page' }));
+      return;
+    }
+    try {
+      await y.destroy();
+      removeInstanceOfY(room);
+      res.end(JSON.stringify({ status: 'SUCCESS', msg: `Delete ${room}` }));
+    } catch (ex) {
+      console.error(ex);
+      res.end(JSON.stringify({ status: 'FAILURE', msg: 'Y instance destroy error' }));
+    }
+  } catch (ex) {
+    console.error(ex);
+    res.end(JSON.stringify({ status: 'FAILURE', msg: ex }));
+  }
+});
+
+io.on('connection', (socket) => {
+  const rooms = [];
+  socket.on('joinRoom', async (escapedRoom) => {
+    // TODO: Will be solved in future https://github.com/y-js/y-websockets-server/commit/2c8588904a334631cb6f15d8434bb97064b59583#diff-e6a5b42b2f7a26c840607370aed5301a
+    const room = decodeURIComponent(escapedRoom);
+    console.log('User', socket.id, 'joins room:', room);
+    socket.join(escapedRoom);
+    const y = await getInstanceOfY(room);
+    if (rooms.indexOf(room) === -1) {
+      y.connector.userJoined(socket.id, 'slave');
+      rooms.push(room);
+      metadata[room].active += 1;
+      io.in(escapedRoom).emit('activeUser', metadata[room].active);
+    }
+  });
+  socket.on('create', (data) => {
+    client.query(`insert into article (text, name, authorid) values ('', '${data['pagename']}', ${data['userid']});`, (err, res) => {
+      console.log(err, res)
+      client.end()
+    })
+    client.query(`select * from  article where authorid=${data['userid']} and name='${data['pagename']}');`, (err, res) => {
+      console.log(err, res)
+      client.end()
+    })
+  })
+  socket.on('yjsEvent', async (msg) => {
+    if (msg.room != null) {
+      // TODO: Will be solved in future https://github.com/y-js/y-websockets-server/commit/2c8588904a334631cb6f15d8434bb97064b59583#diff-e6a5b42b2f7a26c840607370aed5301a
+      const room = decodeURIComponent(msg.room);
+      const y = await getInstanceOfY(room);
+      y.connector.receiveMessage(socket.id, msg);
+      if (msg.type === 'update') {
+        metadata[room].modified = new Date();
+      }
+    }
+  });
+  socket.on('disconnect', async () => {
+    await Promise.all(rooms.map(async (room) => {
+      const y = await getInstanceOfY(room);
+      y.connector.userLeft(socket.id);
+      metadata[room].active -= 1;
+      // TODO: Will be solved in future https://github.com/y-js/y-websockets-server/commit/2c8588904a334631cb6f15d8434bb97064b59583#diff-e6a5b42b2f7a26c840607370aed5301a
+      const escapedRoom = encodeURIComponent(room);
+      io.in(escapedRoom).emit('activeUser', metadata[room].active);
+      io.in(escapedRoom).emit('clientCursor', { type: 'delete', id: getSha1Hash(socket.id) });
+    }));
+    rooms.splice(0, rooms.length);
+  });
+  socket.on('leaveRoom', async (escapedRoom) => {
+    // TODO: Will be solved in future https://github.com/y-js/y-websockets-server/commit/2c8588904a334631cb6f15d8434bb97064b59583#diff-e6a5b42b2f7a26c840607370aed5301a
+    const room = decodeURIComponent(escapedRoom);
+    const y = await getInstanceOfY(room);
+    const i = rooms.indexOf(room);
+    if (i >= 0) {
+      y.connector.userLeft(socket.id);
+      rooms.splice(i, 1);
+      metadata[room].active -= 1;
+      io.in(room).emit('activeUser', metadata[room].active);
+      io.in(room).emit('clientCursor', { type: 'delete', id: getSha1Hash(socket.id) });
+    }
+  });
+  socket.on('clientCursor', (msg) => {
+    if (msg.room != null) {
+      const msgCloned = clone(msg);
+      msgCloned.id = getSha1Hash(socket.id);
+      // TODO: Will be solved in future https://github.com/y-js/y-websockets-server/commit/2c8588904a334631cb6f15d8434bb97064b59583#diff-e6a5b42b2f7a26c840607370aed5301a
+      socket.to(encodeURIComponent(msg.room)).emit('clientCursor', msgCloned);
+    }
+  });
+});
+
+server.listen(port, () => {
+  console.log(`Running y-websockets-server on port ${port}`);
+});
